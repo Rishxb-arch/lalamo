@@ -18,6 +18,7 @@ from lalamo.models.thinking_budget import (
     ThinkingProgress,
     advance_thinking_state,
     apply_thinking_budget,
+    prompt_closes_thinking,
     resolve_end_of_thinking_token_ids,
 )
 from lalamo.module import LogicalAxis
@@ -305,6 +306,14 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             end_of_thinking_tag=self.token_codec.config.end_of_thinking_tag,
             encode_tag=self.token_codec.encode_text,
         )
+        batch_size = prompt_token_ids.shape[0]
+        if thinking_token_ids is None:
+            initial_thinking_closed = jnp.zeros((batch_size,), dtype=jnp.bool_)
+        else:
+            initial_thinking_closed = self._prompts_already_closed_thinking(
+                prompt_token_ids,
+                prompt_lengths_without_padding,
+            )
         return self._generate_tokens(
             prompt_token_ids,
             generation_config,
@@ -315,8 +324,29 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             prefill_forward_pass_config,
             decode_forward_pass_config,
             thinking_token_ids,
+            initial_thinking_closed,
             keychain=keychain,
         )
+
+    def _prompts_already_closed_thinking(
+        self,
+        prompt_token_ids: Int[Array, "batch prompt_tokens"],
+        prompt_lengths_without_padding: Int[Array, " batch"] | None,
+    ) -> Bool[Array, " batch"]:
+        rows = prompt_token_ids.tolist()
+        if prompt_lengths_without_padding is None:
+            lengths = [len(row) for row in rows]
+        else:
+            lengths = [int(length) for length in prompt_lengths_without_padding.tolist()]
+        tag = self.token_codec.config.end_of_thinking_tag
+        closed = [
+            prompt_closes_thinking(
+                self.token_codec.decode_tokens([int(token_id) for token_id in row[:length]]),
+                tag,
+            )
+            for row, length in zip(rows, lengths, strict=True)
+        ]
+        return jnp.asarray(closed, dtype=jnp.bool_)
 
     @eqx.filter_jit
     def _generate_tokens(
@@ -330,6 +360,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         prefill_forward_pass_config: DecoderForwardPassConfig | None,
         decode_forward_pass_config: DecoderForwardPassConfig | None,
         thinking_token_ids: tuple[int, ...] | None,
+        initial_thinking_closed: Bool[Array, " batch"],
         *,
         keychain: Keychain,
     ) -> GenerationResults:
@@ -510,7 +541,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 batch_vector_sharding,
             )
             thinking_closed = jax.device_put(
-                jnp.zeros((batch_size,), dtype=jnp.bool_),
+                initial_thinking_closed,
                 batch_vector_sharding,
             )
 
@@ -616,7 +647,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             end_of_thinking_tag=self.token_codec.config.end_of_thinking_tag,
             encode_tag=self.token_codec.encode_text,
         )
-        thinking_progress = None if thinking_token_ids is None else ThinkingProgress.start(thinking_token_ids)
+        already_closed = False
+        if thinking_token_ids is not None:
+            prompt_text = self.token_codec.decode_tokens([int(token_id) for token_id in prompt_token_ids.tolist()])
+            already_closed = prompt_closes_thinking(prompt_text, self.token_codec.config.end_of_thinking_tag)
+        thinking_progress = (
+            None if thinking_token_ids is None else ThinkingProgress.start(thinking_token_ids, closed=already_closed)
+        )
         if prefill_forward_pass_config is None:
             prefill_forward_pass_config = DecoderForwardPassConfig.for_inference()
         if decode_forward_pass_config is None:

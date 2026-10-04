@@ -13,10 +13,11 @@ and they do count toward `max_output_length`. Generation still stops at EOS.
 If EOS or the length limit arrives before the tag fits, the tag can be cut
 short.
 
-This assumes the prompt left the reasoning section open. A template that
-already closed thinking (reasoning disabled) will receive another copy of the
-tag if a budget is also set. Models with no `end_of_thinking_tag` raise
-`ValueError` when a budget is set, because there is no boundary to force.
+If the prompt already ends with the end-of-thinking tag, the section is
+closed and a budget does not insert another copy. A tag earlier in the
+prompt, such as one quoted by the user, does not count. Models with no
+`end_of_thinking_tag` raise `ValueError` when a budget is set, because
+there is no boundary to force.
 Continuous batching does not implement the cap and rejects it instead of
 ignoring it.
 
@@ -38,6 +39,7 @@ __all__ = [
     "apply_thinking_budget",
     "matched_tag_prefix_length",
     "matched_tag_prefix_lengths",
+    "prompt_closes_thinking",
     "resolve_end_of_thinking_token_ids",
 ]
 
@@ -65,6 +67,22 @@ def resolve_end_of_thinking_token_ids(
     if any(token_id < 0 for token_id in token_ids):
         raise ValueError("end_of_thinking_tag encoded to a negative token id.")
     return token_ids
+
+
+def prompt_closes_thinking(prompt_text: str, end_of_thinking_tag: str | None) -> bool:
+    """True when `prompt_text` has already ended its reasoning section.
+
+    Only a tag at the end of the prompt counts, ignoring trailing whitespace.
+    """
+    if not end_of_thinking_tag:
+        return False
+    marker = end_of_thinking_tag.strip()
+    if not marker:
+        return False
+    index = prompt_text.rfind(marker)
+    if index < 0:
+        return False
+    return prompt_text[index + len(marker) :].strip() == ""
 
 
 def matched_tag_prefix_length(recent_token_ids: tuple[int, ...], tag_token_ids: tuple[int, ...]) -> int:
@@ -96,11 +114,11 @@ class ThinkingProgress:
     closed: bool
 
     @staticmethod
-    def start(tag_token_ids: tuple[int, ...]) -> "ThinkingProgress":
+    def start(tag_token_ids: tuple[int, ...], *, closed: bool = False) -> "ThinkingProgress":
         return ThinkingProgress(
             unclosed_token_count=0,
             recent_token_ids=(MISSING_TOKEN_ID,) * len(tag_token_ids),
-            closed=False,
+            closed=closed,
         )
 
     def forced_token_id(self, tag_token_ids: tuple[int, ...], thinking_budget: int) -> int | None:

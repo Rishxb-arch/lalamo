@@ -23,6 +23,7 @@ from lalamo.models.thinking_budget import (
     apply_thinking_budget,
     matched_tag_prefix_length,
     matched_tag_prefix_lengths,
+    prompt_closes_thinking,
     resolve_end_of_thinking_token_ids,
 )
 from lalamo.module import Keychain
@@ -57,6 +58,16 @@ def _tag_index(token_ids: list[int], tag: tuple[int, ...]) -> int:
         if tuple(token_ids[index : index + tag_length]) == tag:
             return index
     raise AssertionError(f"end-of-thinking tag {tag} not found in {token_ids}")
+
+
+def test_prompt_closes_thinking_only_when_the_tag_ends_the_prompt() -> None:
+    assert prompt_closes_thinking("assistant\n<think>\n\n</think>\n\n", "\n</think>")
+    assert not prompt_closes_thinking("assistant\n", "\n</think>")
+    assert not prompt_closes_thinking("the user wrote </think> earlier\nassistant\n", "\n</think>")
+    assert not prompt_closes_thinking("assistant\n</think> and then more", "\n</think>")
+    assert not prompt_closes_thinking("assistant\n</think>\n\n", None)
+    progress = ThinkingProgress.start(TAG, closed=True)
+    assert progress.forced_token_id(TAG, thinking_budget=0) is None
 
 
 def test_budget_zero_appends_the_tag_before_sampling() -> None:
@@ -351,6 +362,57 @@ def test_batched_generate_forces_the_tag_on_every_row() -> None:
     assert generated.token_ids.shape == (2, 5)
     for row in generated.token_ids.tolist():
         assert tuple(int(token_id) for token_id in row[: len(TAG)]) == TAG
+
+
+def _stream(
+    model: LanguageModel,
+    prompt: tuple[int, ...],
+    generation_config: GenerationConfig,
+    limit: int,
+    seed: int,
+) -> list[int]:
+    token_ids = []
+    for token_id in model.stream_tokens(
+        jnp.asarray(prompt, dtype=jnp.int32),
+        generation_config=generation_config,
+        max_output_length=limit,
+        keychain=Keychain.init(seed, sharding_config=model.sharding_config),
+    ):
+        token_ids.append(int(token_id))
+        if len(token_ids) >= limit:
+            break
+    return token_ids
+
+
+def test_already_closed_prompt_is_not_forced_again() -> None:
+    model = _tiny_model(TAG_TEXT)
+    closed_prompt = (*PROMPT, *TAG)
+    assert prompt_closes_thinking(model.token_codec.decode_tokens(list(closed_prompt)), TAG_TEXT)
+    budget = GenerationConfig(temperature=0.0, thinking_budget=0)
+    plain = GenerationConfig(temperature=0.0)
+    assert _generate(model, closed_prompt, budget, 5, seed=5) == _generate(model, closed_prompt, plain, 5, seed=5)
+    assert _stream(model, closed_prompt, budget, 4, seed=5) == _stream(model, closed_prompt, plain, 4, seed=5)
+
+    open_row = (*PROMPT, 0, 0, 0)
+    prompts = jnp.asarray([open_row, closed_prompt], dtype=jnp.int32)
+    lengths = jnp.asarray([len(PROMPT), len(closed_prompt)], dtype=jnp.int32)
+    with jax.set_mesh(model.sharding_config.mesh):
+        forced = model.generate_tokens(
+            prompts,
+            generation_config=budget,
+            prompt_lengths_without_padding=lengths,
+            max_output_length=5,
+            keychain=Keychain.init(6, sharding_config=model.sharding_config),
+        ).token_ids
+        baseline = model.generate_tokens(
+            prompts,
+            generation_config=plain,
+            prompt_lengths_without_padding=lengths,
+            max_output_length=5,
+            keychain=Keychain.init(6, sharding_config=model.sharding_config),
+        ).token_ids
+    assert tuple(int(token_id) for token_id in forced[0, : len(TAG)].tolist()) == TAG
+    assert forced[1].tolist() == baseline[1].tolist()
 
 
 def test_stream_forces_the_tag_without_an_explicit_mesh() -> None:
