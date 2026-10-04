@@ -41,6 +41,18 @@ uv run lalamo chat MODEL_PATH --message "What is 17 * 19?" --thinking-budget 16
 
 `--thinking-budget N` caps how many tokens a model may spend in its reasoning section. At the cap, generation appends that model's end-of-thinking tag and continues with the answer. `0` skips reasoning. Tag tokens are not part of the budget, and they do count toward `--max-tokens`. Omitting the flag leaves generation unchanged. If the prompt already ends with that tag, thinking is closed and the budget does not insert another copy.
 
+Greedy Qwen3-0.6B (`--temperature 0`) on `What is 17 * 19?` with `--thinking-budget 16` (stop token omitted):
+
+```text
+<think>
+Okay, so I need to figure out what 17 multiplied by
+</think>
+
+17 multiplied by 19 is 323. Let me check that again. 17 times 20 would be 340, so subtracting 17 gives 340 - 17 = 323. Yep, that seems right.
+```
+
+With no budget, the same prompt was still inside `<think>` after 240 tokens, and the first 16 of those tokens are the prefix above. `--thinking-budget 0` skips reasoning and answers `323`.
+
 Models with no end-of-thinking tag reject the flag. The continuous-batching server does not accept it either; use `chat`, `LanguageModel.generate_tokens`, or `LanguageModel.stream_tokens`.
 
 ## Model Support
