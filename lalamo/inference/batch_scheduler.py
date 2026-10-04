@@ -1006,6 +1006,11 @@ class ContinuousBatchScheduler(BatchScheduler):
         fast_peak_memory: bool = False,
         keychain: Keychain | None = None,
     ) -> Iterator[tuple[int, GeneratedSequence]]:
+        if generation_config is not None and generation_config.thinking_budget is not None:
+            raise ValueError(
+                "thinking_budget is not supported by continuous batching. "
+                "Use LanguageModel.generate_tokens, LanguageModel.stream_tokens, or the chat command.",
+            )
         if batch_scheduler_config.num_top_logits_to_return is not None:
             raise RuntimeError("num_top_logits_to_return is not supported with ContinuousBatchScheduler.")
 

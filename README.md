@@ -33,6 +33,16 @@ Note: on some CPU platform you may be getting an error saying `The precision 'F1
 
 After that, you can find the converted model in the `models` folder. For more options see `uv run lalamo convert --help`.
 
+## Chat
+
+```bash
+uv run lalamo chat MODEL_PATH --message "What is 17 * 19?" --thinking-budget 16
+```
+
+`--thinking-budget N` caps how many tokens a model may spend in its reasoning section. At the cap, generation appends that model's end-of-thinking tag and continues with the answer. `0` skips reasoning. Tag tokens are not part of the budget, and they do count toward `--max-tokens`. Omitting the flag leaves generation unchanged.
+
+Models with no end-of-thinking tag reject the flag. The continuous-batching server does not accept it either; use `chat`, `LanguageModel.generate_tokens`, or `LanguageModel.stream_tokens`.
+
 ## Model Support
 
 To add support for a new model, write the corresponding [ModelSpec](lalamo/model_import/model_specs), as shown in the example below:

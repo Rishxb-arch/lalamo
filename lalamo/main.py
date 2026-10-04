@@ -110,6 +110,27 @@ def _error(message: str) -> None:
     raise Exit(1)
 
 
+def _chat_generation_config(
+    model_generation_config: GenerationConfig,
+    *,
+    temperature: float | None,
+    thinking_budget: int | None,
+) -> GenerationConfig | None:
+    if temperature is None and thinking_budget is None:
+        return None
+    if temperature is not None and thinking_budget is not None:
+        return replace(
+            model_generation_config,
+            temperature=temperature,
+            thinking_budget=thinking_budget,
+        )
+    if temperature is not None:
+        return replace(model_generation_config, temperature=temperature)
+    if thinking_budget is None:
+        return None
+    return replace(model_generation_config, thinking_budget=thinking_budget)
+
+
 @app.command(help="Chat with a converted model.")
 def chat(
     model_path: Annotated[
@@ -139,6 +160,19 @@ def chat(
             show_default="model default",
         ),
     ] = None,
+    thinking_budget: Annotated[
+        int | None,
+        Option(
+            "--thinking-budget",
+            min=0,
+            help=(
+                "Maximum reasoning tokens before the model's end-of-thinking tag is appended "
+                "and the answer continues. 0 skips reasoning. The tag itself is not counted. "
+                "Omit to leave thinking unchanged. Models without an end-of-thinking tag reject this option."
+            ),
+            show_default="unset",
+        ),
+    ] = None,
 ) -> None:
     generation_config: GenerationConfig | None = None
     with Progress(
@@ -149,8 +183,11 @@ def chat(
     ) as progress:
         loading_task = progress.add_task("🚀 [cyan]Loading model...[/cyan]")
         model = LanguageModel.load(model_path, ShardingConfig.replicated())
-        if temperature is not None:
-            generation_config = replace(model.config.generation_config, temperature=temperature)
+        generation_config = _chat_generation_config(
+            model.config.generation_config,
+            temperature=temperature,
+            thinking_budget=thinking_budget,
+        )
         progress.remove_task(loading_task)
 
     with jax.set_mesh(model.sharding_config.mesh):

@@ -13,6 +13,13 @@ from tokenizers import Tokenizer
 from lalamo.initializer import Initializer
 from lalamo.model import Model, ModelConfig
 from lalamo.models.chat_codec import AssistantMessage, ChatCodec, ChatCodecConfig, Message, ReasoningEffort
+from lalamo.models.thinking_budget import (
+    MISSING_TOKEN_ID,
+    ThinkingProgress,
+    advance_thinking_state,
+    apply_thinking_budget,
+    resolve_end_of_thinking_token_ids,
+)
 from lalamo.module import LogicalAxis
 from lalamo.modules import (
     Decoder,
@@ -72,6 +79,12 @@ class GenerationResults(NamedTuple):
 
 @dataclass(frozen=True)
 class GenerationConfig:
+    """Sampling controls for one generation call.
+
+    `thinking_budget` caps tokens before the model's end-of-thinking tag.
+    `None` leaves generation unchanged. See `lalamo.models.thinking_budget`.
+    """
+
     stop_token_ids: tuple[int, ...] = ()
     temperature: float | None = None
     top_k: int | None = None
@@ -82,6 +95,7 @@ class GenerationConfig:
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     suffix_repetition_length: int | None = None
+    thinking_budget: int | None = None
 
     def override_with(self, other: Self) -> Self:
         default_config = GenerationConfig()
@@ -271,7 +285,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             state=state,
         )
 
-    @eqx.filter_jit
     def generate_tokens(
         self,
         prompt_token_ids: Int[Array, "batch prompt_tokens"],
@@ -282,6 +295,40 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         num_top_logits_to_return: int | None = None,
         prefill_forward_pass_config: DecoderForwardPassConfig | None = None,
         decode_forward_pass_config: DecoderForwardPassConfig | None = None,
+        *,
+        keychain: Keychain,
+    ) -> GenerationResults:
+        thinking_budget = None if generation_config is None else generation_config.thinking_budget
+        thinking_token_ids = resolve_end_of_thinking_token_ids(
+            thinking_budget=thinking_budget,
+            end_of_thinking_tag=self.token_codec.config.end_of_thinking_tag,
+            encode_tag=self.token_codec.encode_text,
+        )
+        return self._generate_tokens(
+            prompt_token_ids,
+            generation_config,
+            prompt_lengths_without_padding,
+            max_output_length,
+            eos_token_ids,
+            num_top_logits_to_return,
+            prefill_forward_pass_config,
+            decode_forward_pass_config,
+            thinking_token_ids,
+            keychain=keychain,
+        )
+
+    @eqx.filter_jit
+    def _generate_tokens(
+        self,
+        prompt_token_ids: Int[Array, "batch prompt_tokens"],
+        generation_config: GenerationConfig | None,
+        prompt_lengths_without_padding: Int[Array, " batch"] | None,
+        max_output_length: int,
+        eos_token_ids: Int[Array, " eos_tokens"] | None,
+        num_top_logits_to_return: int | None,
+        prefill_forward_pass_config: DecoderForwardPassConfig | None,
+        decode_forward_pass_config: DecoderForwardPassConfig | None,
+        thinking_token_ids: tuple[int, ...] | None,
         *,
         keychain: Keychain,
     ) -> GenerationResults:
@@ -357,18 +404,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         ) -> Int[Array, ""]:
             return jax.random.categorical(sample_key, logits)
 
-        def loop_iteration(
+        def step_after_token(
             state: DecodingState,
-            step_keys: tuple[Key[Array, " batch"], Key[Array, "..."]],
+            chosen_token_ids: Int[Array, " batch"],
+            processed_logits: Float[Array, "batch vocabulary"],
+            decoding_key: Key[Array, "..."],
         ) -> tuple[DecodingState, GenerationStepResults]:
-            sampling_keys, decoding_key = step_keys
-            processed_logits = call_vmapped(
-                lambda policy, logits: policy.process_logits(logits),
-                state.sampling_policy,
-                state.last_token_logits.astype(jnp.float32),
-            )
-            next_token_ids = call_vmapped(sample_token, processed_logits, sampling_keys)
-            next_token_ids = jnp.where(state.stop_flags, stopped_token_ids, next_token_ids)
+            next_token_ids = jnp.where(state.stop_flags, stopped_token_ids, chosen_token_ids)
             next_sampling_policy = call_vmapped(
                 lambda policy, token_id, should_count: policy.with_next_token_count(token_id, should_count),
                 state.sampling_policy,
@@ -413,6 +455,19 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 ),
             )
 
+        def sample_step(
+            state: DecodingState,
+            step_keys: tuple[Key[Array, " batch"], Key[Array, "..."]],
+        ) -> tuple[Int[Array, " batch"], Float[Array, "batch vocabulary"], Key[Array, "..."]]:
+            sampling_keys, decoding_key = step_keys
+            processed_logits = call_vmapped(
+                lambda policy, logits: policy.process_logits(logits),
+                state.sampling_policy,
+                state.last_token_logits.astype(jnp.float32),
+            )
+            sampled_token_ids = call_vmapped(sample_token, processed_logits, sampling_keys)
+            return sampled_token_ids, processed_logits, decoding_key
+
         sampling_keys = sampling_keychain.rolling_broadcast(
             (max_output_length, batch_size),
             mode=KeychainBroadcastMode.PREFIX,
@@ -425,7 +480,78 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             (max_output_length, *decoding_keychain.vmapped_keys.shape),
             mode=KeychainBroadcastMode.PREFIX,
         ).vmapped_keys
-        _, generated = jax.lax.scan(loop_iteration, initial_state, (sampling_keys, decoding_keys))
+        step_inputs = (sampling_keys, decoding_keys)
+
+        if thinking_token_ids is None:
+
+            def loop_iteration(
+                state: DecodingState,
+                step_keys: tuple[Key[Array, " batch"], Key[Array, "..."]],
+            ) -> tuple[DecodingState, GenerationStepResults]:
+                sampled_token_ids, processed_logits, decoding_key = sample_step(state, step_keys)
+                return step_after_token(state, sampled_token_ids, processed_logits, decoding_key)
+
+            _, generated = jax.lax.scan(loop_iteration, initial_state, step_inputs)
+        else:
+            assert generation_config is not None
+            assert generation_config.thinking_budget is not None
+            budget = generation_config.thinking_budget
+            tag_ids = jax.device_put(
+                jnp.asarray(thinking_token_ids, dtype=jnp.int32),
+                self.sharding_config.make_sharding((None,)),
+            )
+            recent_token_ids = jax.device_put(
+                jnp.full((batch_size, len(thinking_token_ids)), MISSING_TOKEN_ID, dtype=jnp.int32),
+                self.sharding_config.make_sharding((batch_axis, None)),
+            )
+            unclosed_token_count = jax.device_put(
+                jnp.zeros((batch_size,), dtype=jnp.int32),
+                batch_vector_sharding,
+            )
+            thinking_closed = jax.device_put(
+                jnp.zeros((batch_size,), dtype=jnp.bool_),
+                batch_vector_sharding,
+            )
+
+            def loop_iteration_with_budget(
+                carry: tuple[
+                    DecodingState,
+                    Int[Array, "batch tag"],
+                    Int[Array, " batch"],
+                    Bool[Array, " batch"],
+                ],
+                step_keys: tuple[Key[Array, " batch"], Key[Array, "..."]],
+            ) -> tuple[
+                tuple[DecodingState, Int[Array, "batch tag"], Int[Array, " batch"], Bool[Array, " batch"]],
+                GenerationStepResults,
+            ]:
+                state, recent, unclosed, closed = carry
+                sampled_token_ids, processed_logits, decoding_key = sample_step(state, step_keys)
+                chosen_token_ids = apply_thinking_budget(
+                    sampled_token_ids,
+                    state.stop_flags,
+                    recent,
+                    unclosed,
+                    closed,
+                    tag_ids,
+                    budget,
+                )
+                new_state, results = step_after_token(state, chosen_token_ids, processed_logits, decoding_key)
+                new_recent, new_unclosed, new_closed = advance_thinking_state(
+                    recent,
+                    unclosed,
+                    closed,
+                    results.token_ids,
+                    state.stop_flags,
+                    tag_ids,
+                )
+                return (new_state, new_recent, new_unclosed, new_closed), results
+
+            _, generated = jax.lax.scan(
+                loop_iteration_with_budget,
+                (initial_state, recent_token_ids, unclosed_token_count, thinking_closed),
+                step_inputs,
+            )
 
         token_ids = rearrange(generated.token_ids, "step batch -> batch step")
         if num_top_logits_to_return is None:
@@ -483,6 +609,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
     ) -> Iterable[Int[Array, ""]]:
         if max_output_length < 1:
             raise ValueError("max_output_length must be at least 1.")
+        thinking_budget = None if generation_config is None else generation_config.thinking_budget
+        thinking_token_ids = resolve_end_of_thinking_token_ids(
+            thinking_budget=thinking_budget,
+            end_of_thinking_tag=self.token_codec.config.end_of_thinking_tag,
+            encode_tag=self.token_codec.encode_text,
+        )
+        thinking_progress = None if thinking_token_ids is None else ThinkingProgress.start(thinking_token_ids)
         if prefill_forward_pass_config is None:
             prefill_forward_pass_config = DecoderForwardPassConfig.for_inference()
         if decode_forward_pass_config is None:
@@ -546,10 +679,17 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         for sampling_key, decoding_key in zip(sampling_keys, decoding_keys, strict=True):
             processed_logits = sampling_policy.process_logits(last_token_logits.astype(jnp.float32))
             next_token_id = jax.random.categorical(sampling_key, processed_logits)
+            if thinking_progress is not None and thinking_token_ids is not None and thinking_budget is not None:
+                forced_token_id = thinking_progress.forced_token_id(thinking_token_ids, thinking_budget)
+                if forced_token_id is not None:
+                    next_token_id = jnp.asarray(forced_token_id, dtype=next_token_id.dtype)
             yield next_token_id
 
             if bool(jnp.any(next_token_id == stop_token_ids).item()):
                 return
+
+            if thinking_progress is not None and thinking_token_ids is not None:
+                thinking_progress = thinking_progress.after_token(int(next_token_id), thinking_token_ids)
 
             sampling_policy = sampling_policy.with_next_token_count(next_token_id)
             next_token_index = last_token_index + 1
