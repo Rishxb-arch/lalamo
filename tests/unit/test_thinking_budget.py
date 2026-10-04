@@ -353,6 +353,20 @@ def test_batched_generate_forces_the_tag_on_every_row() -> None:
         assert tuple(int(token_id) for token_id in row[: len(TAG)]) == TAG
 
 
+def test_stream_forces_the_tag_without_an_explicit_mesh() -> None:
+    model = _tiny_model(TAG_TEXT)
+    streamed = [
+        int(token_id)
+        for token_id in model.stream_tokens(
+            jnp.asarray(PROMPT, dtype=jnp.int32),
+            generation_config=GenerationConfig(temperature=0.0, thinking_budget=0),
+            max_output_length=4,
+            keychain=Keychain.init(11, sharding_config=model.sharding_config),
+        )
+    ]
+    assert tuple(streamed[: len(TAG)]) == TAG
+
+
 def test_stream_matches_generate_when_a_budget_is_set() -> None:
     model = _tiny_model(TAG_TEXT)
     prompt = jnp.asarray(PROMPT, dtype=jnp.int32)

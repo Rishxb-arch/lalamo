@@ -32,6 +32,7 @@ from lalamo.modules import (
 from lalamo.modules.token_mixer import State
 from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
+from lalamo.utils.sharding import reshard_as
 
 __all__ = [
     "GenerationConfig",
@@ -682,7 +683,12 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             if thinking_progress is not None and thinking_token_ids is not None and thinking_budget is not None:
                 forced_token_id = thinking_progress.forced_token_id(thinking_token_ids, thinking_budget)
                 if forced_token_id is not None:
-                    next_token_id = jnp.asarray(forced_token_id, dtype=next_token_id.dtype)
+                    # A host scalar does not carry the sampled id's NamedSharding, and the
+                    # embedding lookup rejects it. Place the forced id on that same sharding.
+                    next_token_id = reshard_as(
+                        jnp.asarray(forced_token_id, dtype=next_token_id.dtype),
+                        next_token_id,
+                    )
             yield next_token_id
 
             if bool(jnp.any(next_token_id == stop_token_ids).item()):
