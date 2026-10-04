@@ -51,7 +51,7 @@ Okay, so I need to figure out what 17 multiplied by
 17 multiplied by 19 is 323. Let me check that again. 17 times 20 would be 340, so subtracting 17 gives 340 - 17 = 323. Yep, that seems right.
 ```
 
-With no budget, the same prompt was still inside `<think>` after 240 tokens, and the first 16 of those tokens are the prefix above. `--thinking-budget 0` skips reasoning and answers `323`.
+With no budget, the same prompt was still inside `<think>` after 240 tokens, and the first 16 of those tokens are the prefix above. `--thinking-budget 0` skips reasoning and answers `17 multiplied by 19 is equal to` `17 × 19 = 323`.
 
 Models with no end-of-thinking tag reject the flag. The continuous-batching server does not accept it either; use `chat`, `LanguageModel.generate_tokens`, or `LanguageModel.stream_tokens`.
 
